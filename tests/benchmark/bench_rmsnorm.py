@@ -2,13 +2,18 @@
 #
 # SPDX-License-Identifier: MIT
 
+import argparse
+
 import torch
 import torch.nn.functional as F
 import triton
 
+import cuda.tile as ct
 import tilegym
 from tilegym.backend import is_backend_available
 from tilegym.backend import register_impl
+from tilegym.ops.cutile.rms_norm import rms_norm_kernel_gather_delay_upcast
+from tilegym.ops.cutile.utils import next_power_of_2
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
@@ -36,84 +41,148 @@ def reference_rms_norm(
 register_impl("rms_norm", "torch")(reference_rms_norm)
 
 
+def rms_norm_delay_upcast(
+    input: torch.Tensor,
+    normalized_shape: tuple,
+    weight: torch.Tensor,
+    eps: float,
+    bias: torch.Tensor = None,
+    static_persistent: bool = False,
+    offset: float = 0.0,
+    **kwargs,
+):
+    """Launch rms_norm_kernel_gather_delay_upcast directly."""
+    x = input.contiguous()
+    weight = weight.contiguous()
+    x_arg = x.reshape(-1, x.shape[-1])
+    M, N = x_arg.shape
+    y = torch.empty_like(x_arg)
+    rstd = torch.empty(M, dtype=torch.float32, device=x.device)
+    EPL = next_power_of_2(N)
+    ct.launch(
+        torch.cuda.current_stream(),
+        (M,),
+        rms_norm_kernel_gather_delay_upcast,
+        (x_arg, weight, y, rstd, N, eps, offset, EPL),
+    )
+    return y.view(*x.shape)
+
+
+register_impl("rms_norm", "cutile_delay_upcast")(rms_norm_delay_upcast)
+
+
 # Available backends with their display names and plot styles
+# Each entry: (key, display_name, style, launch_kwargs)
 ALL_BACKENDS = [
-    ("cutile", "CuTile", ("blue", "-")) if is_backend_available("cutile") else None,
-    ("torch", "PyTorch", ("green", "-")),
+    ("cutile_persistent", "CuTile (persistent)", ("blue", "-"), {"backend": "cutile", "static_persistent": True}),
+    ("cutile_gather", "CuTile (gather)", ("cyan", "-"), {"backend": "cutile", "static_persistent": False}),
+    ("cutile_delay_upcast", "CuTile (delay upcast)", ("red", "-"), {"backend": "cutile_delay_upcast", "static_persistent": False}),
+    ("torch", "PyTorch", ("green", "-"), {"backend": "torch", "static_persistent": False}),
 ]
 
 
-def get_supported_backends():
-    """Filter backends based on availability"""
-    return [p for p in ALL_BACKENDS if p is not None]
+def get_supported_backends(selected=None):
+    """Filter backends based on availability and user selection."""
+    available = ALL_BACKENDS if is_backend_available("cutile") else [b for b in ALL_BACKENDS if b[0] == "torch"]
+    if selected is not None:
+        available = [b for b in available if b[0] in selected]
+    return available
 
 
-def create_benchmark_config(dtype, static_persistent=True):
+DTYPE_MAP = {
+    "float16": torch.float16,
+    "fp16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "bf16": torch.bfloat16,
+}
+
+ALL_KERNEL_KEYS = [b[0] for b in ALL_BACKENDS]
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="RMSNorm benchmark")
+    parser.add_argument(
+        "--dtype",
+        nargs="+",
+        default=["float16", "bfloat16"],
+        choices=list(DTYPE_MAP.keys()),
+        help="Data types to benchmark (default: float16 bfloat16)",
+    )
+    parser.add_argument(
+        "--kernel",
+        nargs="+",
+        default=None,
+        choices=ALL_KERNEL_KEYS,
+        help="Kernels to benchmark (default: all available)",
+    )
+    return parser.parse_args()
+
+
+def create_benchmark_config(dtype, backends):
     """Create a benchmark configuration for given parameters"""
-    available_backends = get_supported_backends()
-    if not available_backends:
+    if not backends:
         return None
 
-    backends, names, styles = zip(*available_backends)
-    dtype_name = str(dtype).split(".")[-1]  # e.g., 'float16' from 'torch.float16'
+    keys, names, styles, _ = zip(*backends)
+    dtype_name = str(dtype).split(".")[-1]
 
     return triton.testing.Benchmark(
         x_names=["N"],
         x_vals=[2**i for i in range(10, 15)],  # Hidden size from 1024 to 16384
-        line_arg="backend",
-        line_vals=list(backends),
+        line_arg="kernel",
+        line_vals=list(keys),
         line_names=list(names),
         styles=list(styles),
         ylabel="GB/s",
-        plot_name=f"rmsnorm-performance-{dtype_name}-persistent-{static_persistent}-GBps",
+        plot_name=f"rmsnorm-performance-{dtype_name}-GBps",
         args={
             "dtype": dtype,
-            "static_persistent": static_persistent,
             "M": 4096,
         },  # Fixed batch*seq_len
     )
 
 
-@triton.testing.perf_report(
-    [
-        create_benchmark_config(dtype, static_persistent)
-        for dtype in [torch.float16, torch.bfloat16]
-        for static_persistent in [True, False]
-    ]
-)
-def bench_rmsnorm(N, backend, dtype, static_persistent, M, device=DEVICE):
-    eps = 1e-5
+# Build lookup from kernel key -> launch kwargs
+_KERNEL_KWARGS = {b[0]: b[3] for b in ALL_BACKENDS}
 
-    # Create input tensors
-    x_shape = (M, N)
-    w_shape = (N,)
 
-    x = torch.rand(x_shape, dtype=dtype, device=device, requires_grad=False).mul_(0.5).add_(-2.3)
-    weight = torch.randn(w_shape, dtype=dtype, device=device, requires_grad=False)
+def make_bench(configs):
+    @triton.testing.perf_report(configs)
+    def bench_rmsnorm(N, kernel, dtype, M, device=DEVICE):
+        eps = 1e-5
 
-    fn = lambda: tilegym.ops.rms_norm(x, w_shape, weight, eps, static_persistent=static_persistent, backend=backend)
-    ref = lambda: reference_rms_norm(x, w_shape, weight, eps)
-    torch.testing.assert_close(fn(), ref(), atol=5e-2, rtol=0.0)
+        x_shape = (M, N)
+        w_shape = (N,)
 
-    # Benchmark the function
-    ms = triton.testing.do_bench_cudagraph(fn)
+        x = torch.rand(x_shape, dtype=dtype, device=device, requires_grad=False).mul_(0.5).add_(-2.3)
+        weight = torch.randn(w_shape, dtype=dtype, device=device, requires_grad=False)
 
-    # Calculate memory bandwidth (GB/s)
-    # RMSNorm operation: read input, read weight, write output
-    # Memory access: read x + read weight + write output
-    bytes_per_element = x.element_size()
+        kw = _KERNEL_KWARGS[kernel]
+        fn = lambda: tilegym.ops.rms_norm(x, w_shape, weight, eps, **kw)
+        ref = lambda: reference_rms_norm(x, w_shape, weight, eps)
+        torch.testing.assert_close(fn(), ref(), atol=5e-2, rtol=0.0)
 
-    input_bytes = x.numel() * bytes_per_element  # Read input
-    weight_bytes = weight.numel() * bytes_per_element  # Read weight
-    output_bytes = x.numel() * bytes_per_element  # Write output
+        ms = triton.testing.do_bench_cudagraph(fn)
 
-    total_bytes = input_bytes + weight_bytes + output_bytes
+        bytes_per_element = x.element_size()
+        input_bytes = x.numel() * bytes_per_element
+        weight_bytes = weight.numel() * bytes_per_element
+        output_bytes = x.numel() * bytes_per_element
+        total_bytes = input_bytes + weight_bytes + output_bytes
 
-    # Convert to GB/s
-    gb_per_s = total_bytes * 1e-9 / (ms * 1e-3)
+        gb_per_s = total_bytes * 1e-9 / (ms * 1e-3)
+        return gb_per_s
 
-    return gb_per_s
+    return bench_rmsnorm
 
 
 if __name__ == "__main__":
-    bench_rmsnorm.run(print_data=True)
+    args = parse_args()
+    dtypes = list(dict.fromkeys(DTYPE_MAP[d] for d in args.dtype))
+    backends = get_supported_backends(selected=args.kernel)
+    configs = [create_benchmark_config(dt, backends) for dt in dtypes]
+    configs = [c for c in configs if c is not None]
+    if not configs:
+        print("No valid benchmark configurations. Check --dtype and --kernel args.")
+    else:
+        make_bench(configs).run(print_data=True)

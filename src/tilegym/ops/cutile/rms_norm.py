@@ -13,6 +13,49 @@ from .utils import next_power_of_2
 
 
 @ct.kernel
+def rms_norm_kernel_gather_delay_upcast(
+    x,
+    w,
+    out,
+    Rstd,
+    N: ct.Constant[int],
+    eps: ct.Constant[float],
+    offset: ct.Constant[float],
+    EPL: ct.Constant[int],
+):
+    """
+    RMSNorm kernel using gather with delayed upcast to float32.
+
+    Single-pass: loads the entire row in native dtype (bf16), keeping it
+    live in registers while computing inv_rms, then normalizes and stores
+    without re-loading from DRAM.
+
+    Delayed upcast reduces register pressure during the load phase since
+    bf16 packs 2 values per 32-bit register (SASS FMUL2.F32x2.HI_LO).
+
+    Formula: y = norm(x) * (offset + w)
+    For Llama: offset=0.0, For Gemma3: offset=1.0
+    """
+    row = ct.bid(0)
+    offs = ct.arange(EPL, dtype=ct.int32)
+    row_idx = ct.full((EPL,), 0, dtype=ct.int32) + row
+
+    # Load entire row in native dtype (bf16) — stays packed in registers
+    xr = ct.gather(x, (row_idx, offs), check_bounds=False, latency=10)
+
+    # Upcast to fp32 only for reduction
+    xf = ct.astype(xr, ct.float32)
+    ss = xf * xf
+    inv_rms = ct.rsqrt(ct.sum(ss, axis=0, keepdims=False) / N + eps)
+    ct.scatter(Rstd, row, inv_rms)
+
+    # Load weight, normalize, store — x data already in registers
+    wr = ct.gather(w, offs, check_bounds=False, latency=1)
+    wf = ct.astype(wr, ct.float32)
+    yf = xf * inv_rms * (offset + wf)
+    ct.scatter(out, (row_idx, offs), ct.astype(yf, x.dtype), check_bounds=False, latency=1)
+
+@ct.kernel
 def rms_norm_kernel_gather(
     x,
     w,
