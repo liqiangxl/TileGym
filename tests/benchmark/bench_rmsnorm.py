@@ -5,12 +5,37 @@
 import torch
 import torch.nn.functional as F
 import triton
+from torch.profiler import ProfilerActivity, profile
 
 import tilegym
 from tilegym.backend import is_backend_available
 from tilegym.backend import register_impl
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
+
+
+def profile_kernel_ms(fn, warmup=20, rep=100):
+    """Measure kernel-only GPU time using torch.profiler, with L2 flush between reps."""
+    l2_size = torch.cuda.get_device_properties(0).L2_cache_size
+    l2_flush = torch.empty(l2_size // 4, dtype=torch.float32, device="cuda")
+
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+
+    times_us = []
+    for _ in range(rep):
+        l2_flush.zero_()
+        torch.cuda.synchronize()
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            fn()
+            torch.cuda.synchronize()
+        kernel_us = sum(evt.device_time_total for evt in prof.key_averages() if evt.device_time_total > 0)
+        times_us.append(kernel_us)
+
+    times_us.sort()
+    median_us = times_us[len(times_us) // 2]
+    return median_us / 1000.0  # ms
 
 
 def reference_rms_norm(
@@ -102,7 +127,7 @@ def bench_rmsnorm(N, config_idx, dtype, M, device=DEVICE):
     torch.testing.assert_close(fn(), ref(), atol=5e-2, rtol=0.0)
 
     # Benchmark the function
-    ms = triton.testing.do_bench_cudagraph(fn)
+    ms = profile_kernel_ms(fn)
 
     # Calculate memory bandwidth (GB/s)
     # RMSNorm operation: read input, read weight, write output
